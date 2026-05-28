@@ -1,0 +1,64 @@
+version: '3.9'
+
+services:
+  mongodb:
+    image: mongo:7.0
+    container_name: erp_mongodb
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: erppassword
+      MONGO_INITDB_DATABASE: erp_db
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+      - ./mongo-init/init.js:/docker-entrypoint-initdb.d/init.js:ro
+    networks:
+      - erp_network
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongosh localhost:27017/erp_db --quiet
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: erp_backend
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 3001
+      MONGODB_URI: mongodb://admin:erppassword@mongodb:27017/erp_db?authSource=admin
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+    ports:
+      - "3001:3001"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    networks:
+      - erp_network
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: erp_frontend
+    restart: unless-stopped
+    environment:
+      REACT_APP_API_URL: http://localhost:3001
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    networks:
+      - erp_network
+
+volumes:
+  mongo_data:
+
+networks:
+  erp_network:
+    driver: bridge
