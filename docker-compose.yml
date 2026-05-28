@@ -32,7 +32,7 @@ services:
       NODE_ENV: production
       PORT: 3001
       MONGODB_URI: mongodb://admin:erppassword@mongodb:27017/erp_db?authSource=admin
-      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      CEREBRAS_API_KEY: ${CEREBRAS_API_KEY}
     ports:
       - "3001:3001"
     depends_on:

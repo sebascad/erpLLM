@@ -2,7 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
+const Cerebras = require('@cerebras/cerebras_cloud_sdk');
 const cron = require('node-cron');
 const routes = require('./routes');
 const toolDefs = require('./llm-tools');
@@ -14,8 +14,10 @@ app.use(express.json());
 
 app.use('/api', routes);
 
-// ========== GEMINI SETUP ==========
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+// ========== CEREBRAS SETUP ==========
+const client = new Cerebras({ apiKey: process.env.CEREBRAS_API_KEY });
+
+const MODEL = 'zai-glm-4.7';
 
 const SYSTEM_PROMPT = `Eres el asistente de gestión de un ERP empresarial. Tu rol es ayudar a los usuarios a gestionar su inventario, proveedores, pedidos y desechos de manera eficiente.
 
@@ -129,72 +131,77 @@ app.post('/api/chat', async (req, res) => {
   }
 
   try {
-    // Convert our {role, content} history to Gemini format
-    // Gemini roles: "user" | "model"  (no "system" in history)
-    const geminiHistory = messages.slice(0, -1).map(m => ({
-      role: m.role === 'assistant' ? 'model' : 'user',
-      parts: [{ text: m.content }]
-    }));
-    const lastUserMessage = messages[messages.length - 1].content;
-
-    const model = genAI.getGenerativeModel({
-      model: 'gemini-1.5-flash',
-      systemInstruction: SYSTEM_PROMPT,
-      tools: [{ functionDeclarations: toolDefs }],
-      toolConfig: { functionCallingConfig: { mode: 'AUTO' } }
-    });
-
-    const chat = model.startChat({ history: geminiHistory });
+    // Build conversation history in OpenAI-compatible format (Cerebras SDK uses same format)
+    const conversationMessages = [
+      { role: 'system', content: SYSTEM_PROMPT },
+      ...messages.map(m => ({ role: m.role, content: m.content }))
+    ];
 
     let navigationAction = null;
     let lastDataResult = null;
 
     // Agentic loop
-    let currentMessage = lastUserMessage;
     while (true) {
-      const result = await chat.sendMessage(currentMessage);
-      const response = result.response;
-      const candidate = response.candidates?.[0];
+      const response = await client.chat.completions.create({
+        model: MODEL,
+        max_completion_tokens: 4096,
+        tools: toolDefs,
+        tool_choice: 'auto',
+        messages: conversationMessages,
+      });
 
-      if (!candidate) {
-        return res.json({ message: 'Sin respuesta del modelo.', navigation: navigationAction, data: lastDataResult });
-      }
+      const choice = response.choices[0];
+      const assistantMessage = choice.message;
 
-      const parts = candidate.content?.parts || [];
-      const functionCalls = parts.filter(p => p.functionCall);
-      const textParts = parts.filter(p => p.text).map(p => p.text).join('');
+      // Add assistant message to history
+      conversationMessages.push(assistantMessage);
 
-      // If no function calls → final answer
-      if (functionCalls.length === 0) {
+      // No tool calls → final answer
+      if (!assistantMessage.tool_calls || assistantMessage.tool_calls.length === 0) {
         return res.json({
-          message: textParts || 'Listo.',
+          message: assistantMessage.content || 'Listo.',
           navigation: navigationAction,
           data: lastDataResult
         });
       }
 
-      // Execute all function calls and build functionResponse parts
-      const responseParts = [];
-      for (const part of functionCalls) {
-        const { name, args } = part.functionCall;
-        const toolResult = await executeTool(name, args || {});
+      // Execute all tool calls in parallel
+      const toolCallPromises = assistantMessage.tool_calls.map(async (toolCall) => {
+        const name = toolCall.function.name;
+        let args = {};
+        try {
+          args = JSON.parse(toolCall.function.arguments || '{}');
+        } catch (_) {}
 
+        const toolResult = await executeTool(name, args);
+        return { toolCall, name, args, toolResult };
+      });
+
+      const toolResults = await Promise.all(toolCallPromises);
+
+      for (const { toolCall, name, args, toolResult } of toolResults) {
         if (name === 'mostrar_vista') {
           navigationAction = args.vista;
         } else if (toolResult.data) {
           lastDataResult = { type: name, ...toolResult };
         }
 
-        responseParts.push({
-          functionResponse: {
-            name,
-            response: toolResult
-          }
+        // Feed tool result back into conversation
+        conversationMessages.push({
+          role: 'tool',
+          tool_call_id: toolCall.id,
+          content: JSON.stringify(toolResult),
         });
       }
 
-      // Feed results back — Gemini expects them as the next user turn
-      currentMessage = responseParts;
+      // Stop if model is done
+      if (choice.finish_reason === 'stop') {
+        return res.json({
+          message: assistantMessage.content || 'Listo.',
+          navigation: navigationAction,
+          data: lastDataResult
+        });
+      }
     }
   } catch (e) {
     console.error('Chat error:', e);
